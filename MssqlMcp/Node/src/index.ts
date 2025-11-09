@@ -21,6 +21,9 @@ import { DropTableTool } from "./tools/DropTableTool.js";
 import { DefaultAzureCredential, InteractiveBrowserCredential } from "@azure/identity";
 import { DescribeTableTool } from "./tools/DescribeTableTool.js";
 
+// Load environment variables
+dotenv.config();
+
 // MSSQL Database connection configuration
 // const credential = new DefaultAzureCredential();
 
@@ -29,16 +32,43 @@ let globalSqlPool: sql.ConnectionPool | null = null;
 let globalAccessToken: string | null = null;
 let globalTokenExpiresOn: Date | null = null;
 
-// Function to create SQL config with fresh access token, returns token and expiry
+// Function to create SQL config - supports both SQL Server Auth and Azure AD
 export async function createSqlConfig(): Promise<{ config: sql.config, token: string, expiresOn: Date }> {
+  const authType = process.env.AUTH_TYPE?.toLowerCase() || 'azure';
+  const trustServerCertificate = process.env.TRUST_SERVER_CERTIFICATE?.toLowerCase() === 'true';
+  const connectionTimeout = process.env.CONNECTION_TIMEOUT ? parseInt(process.env.CONNECTION_TIMEOUT, 10) : 30;
+  const encrypt = process.env.ENCRYPT?.toLowerCase() !== 'false'; // Default to true
+  const port = process.env.DB_PORT ? parseInt(process.env.DB_PORT, 10) : 1433;
+
+  // SQL Server Authentication (username/password)
+  if (authType === 'sql') {
+    console.log('Using SQL Server Authentication');
+    return {
+      config: {
+        server: process.env.SERVER_NAME!,
+        port: port,
+        database: process.env.DATABASE_NAME!,
+        user: process.env.DB_USER!,
+        password: process.env.DB_PASSWORD!,
+        options: {
+          encrypt: encrypt,
+          trustServerCertificate: trustServerCertificate,
+          enableArithAbort: true,
+        },
+        connectionTimeout: connectionTimeout * 1000, // convert seconds to milliseconds
+      },
+      token: '', // No token for SQL auth
+      expiresOn: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) // 1 year (doesn't expire)
+    };
+  }
+
+  // Azure AD Authentication (original behavior)
+  console.log('Using Azure Active Directory Authentication');
   const credential = new InteractiveBrowserCredential({
     redirectUri: 'http://localhost'
     // disableAutomaticAuthentication : true
   });
   const accessToken = await credential.getToken('https://database.windows.net/.default');
-
-  const trustServerCertificate = process.env.TRUST_SERVER_CERTIFICATE?.toLowerCase() === 'true';
-  const connectionTimeout = process.env.CONNECTION_TIMEOUT ? parseInt(process.env.CONNECTION_TIMEOUT, 10) : 30;
 
   return {
     config: {
@@ -164,7 +194,29 @@ runServer().catch((error) => {
 // Connect to SQL only when handling a request
 
 async function ensureSqlConnection() {
-  // If we have a pool and it's connected, and the token is still valid, reuse it
+  const authType = process.env.AUTH_TYPE?.toLowerCase() || 'azure';
+
+  // For SQL Server authentication, we don't need to refresh tokens
+  if (authType === 'sql') {
+    // If we have a pool and it's connected, reuse it
+    if (globalSqlPool && globalSqlPool.connected) {
+      return;
+    }
+
+    // Otherwise, create a new connection
+    const { config } = await createSqlConfig();
+
+    // Close old pool if exists
+    if (globalSqlPool && globalSqlPool.connected) {
+      await globalSqlPool.close();
+    }
+
+    globalSqlPool = await sql.connect(config);
+    console.log('Connected to SQL Server using SQL Authentication');
+    return;
+  }
+
+  // For Azure AD authentication, check token expiry
   if (
     globalSqlPool &&
     globalSqlPool.connected &&
@@ -186,6 +238,7 @@ async function ensureSqlConnection() {
   }
 
   globalSqlPool = await sql.connect(config);
+  console.log('Connected to SQL Server using Azure AD Authentication');
 }
 
 // Patch all tool handlers to ensure SQL connection before running
